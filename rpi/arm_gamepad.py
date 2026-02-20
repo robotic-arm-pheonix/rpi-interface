@@ -3,6 +3,9 @@ import time
 import glob
 import serial
 from evdev import InputDevice, ecodes, list_devices, categorize
+import time
+import errno
+
 
 BAUD = 115200
 SEND_HZ = 30.0  # command rate
@@ -90,15 +93,34 @@ def main():
     try:
         while True:
             # Read all pending events quickly
-            for ev in pad.read():
+
+            try:
+                events = pad.read()
+            except BlockingIOError:
+                events = []
+            except OSError as e:
+                # Just in case: treat EAGAIN like "no events"
+                if e.errno == errno.EAGAIN:
+                    events = []
+                else:
+                    raise
+
+            for ev in events:
                 if ev.type == ecodes.EV_ABS:
                     abs_state[ev.code] = ev.value
-                    if DEBUG_PRINT_EVENTS:
-                        print("ABS", ev.code, ev.value)
                 elif ev.type == ecodes.EV_KEY:
                     key_state[ev.code] = ev.value
-                    if DEBUG_PRINT_EVENTS:
-                        print("KEY", ev.code, ev.value)
+
+
+            # # for ev in pad.read():
+            #     if ev.type == ecodes.EV_ABS:
+            #         abs_state[ev.code] = ev.value
+            #         if DEBUG_PRINT_EVENTS:
+            #             print("ABS", ev.code, ev.value)
+            #     elif ev.type == ecodes.EV_KEY:
+            #         key_state[ev.code] = ev.value
+            #         if DEBUG_PRINT_EVENTS:
+            #             print("KEY", ev.code, ev.value)
 
             now = time.time()
             if now - last_send >= period:
