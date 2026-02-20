@@ -18,7 +18,8 @@ services:
     #   - /dev/ttyACM0:/dev/ttyACM0
     #   - /dev/input:/dev/input
     #   - /dev/bus/usb:/dev/bus/usb
-
+    volumes:
+      - ./arm_gamepad.py:/app/arm_gamepad.py:ro
     environment:
       - PYTHONUNBUFFERED=1
 
