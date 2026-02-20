@@ -1,0 +1,25 @@
+services:
+  arm-controller:
+    build: .
+    container_name: arm-controller
+    restart: unless-stopped
+
+    # Easiest + most compatible for /dev/input + USB serial
+    privileged: true
+
+    # Pass through devices explicitly (still keep privileged for simpler perms)
+    devices:
+      - /dev/input:/dev/input
+      - /dev/bus/usb:/dev/bus/usb
+
+    # Optional: pass through a specific serial device too
+    # If you know it is always /dev/ttyACM0, uncomment:
+    # devices:
+    #   - /dev/ttyACM0:/dev/ttyACM0
+    #   - /dev/input:/dev/input
+    #   - /dev/bus/usb:/dev/bus/usb
+
+    environment:
+      - PYTHONUNBUFFERED=1
+
+    # If you use pad.grab() and it causes issues, you can run non-exclusive by editing python

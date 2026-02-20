@@ -4,24 +4,11 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 
-// --- CONFIGURATION ---
-
 const int NUM_SERVOS = 7;
 const int NUM_ANGLES = 6;
 
-// FINAL correct PCA9685 channel mapping (0-based)
 uint8_t servoChannel[NUM_SERVOS] = { 0, 1, 2, 3, 4, 5, 6 };
-/*
-0 = Root
-1 = Arm A1
-2 = Arm A2 (mirrors A1)
-3 = Arm B
-<!-- 4 = Wrist A
-5 = Wrist B
-6 = Gripper -->
-*/
 
-// PCA9685 settings
 const uint16_t SERVO_FREQ = 50;
 const uint16_t SERVOMIN  = 102;  // ~500µs
 const uint16_t SERVOMAX  = 512;  // ~2500µs
@@ -29,8 +16,6 @@ const uint16_t SERVOMAX  = 512;  // ~2500µs
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
 int angleValues[NUM_ANGLES];
-
-// --- Helpers ---
 
 uint16_t angleToPulse(int angleDeg)
 {
@@ -40,46 +25,69 @@ uint16_t angleToPulse(int angleDeg)
 
 void writeServoAngle(uint8_t ch, int angleDeg)
 {
-  uint16_t pulse = angleToPulse(angleDeg);
-  pwm.setPWM(ch, 0, pulse);
+  pwm.setPWM(ch, 0, angleToPulse(angleDeg));
 }
 
-// --- SETUP ---
+bool readAnglesFromSerial(int *outAngles, int count)
+{
+  static char buf[80];
+  static uint8_t idx = 0;
+
+  while (Serial.available() > 0)
+  {
+    char c = (char)Serial.read();
+
+    // end of line
+    if (c == '\n')
+    {
+      buf[idx] = '\0';
+      idx = 0;
+
+      // parse exactly "a b c d e f"
+      int parsed = 0;
+      char *p = buf;
+
+      for (int i = 0; i < count; i++)
+      {
+        // skip spaces
+        while (*p == ' ') p++;
+        if (*p == '\0') return false;
+
+        outAngles[i] = strtol(p, &p, 10);
+        outAngles[i] = constrain(outAngles[i], 0, 180);
+        parsed++;
+      }
+      return (parsed == count);
+    }
+    else if (c != '\r')
+    {
+      if (idx < sizeof(buf) - 1)
+        buf[idx++] = c;
+      else
+        idx = 0; // overflow -> reset
+    }
+  }
+  return false;
+}
 
 void setup()
 {
-  Serial.begin(9600);
+  Serial.begin(115200);
 
   Wire.begin();
   pwm.begin();
   pwm.setPWMFreq(SERVO_FREQ);
 
-  // Initialize all servos to center
   for (int i = 0; i < NUM_SERVOS; i++)
-  {
     writeServoAngle(servoChannel[i], 90);
-  }
 
   delay(200);
 }
 
-// --- LOOP ---
-
 void loop()
 {
-  // Expecting: "90 90 90 90 90 90\n"
-  if (Serial.available() > 0)
+  if (readAnglesFromSerial(angleValues, NUM_ANGLES))
   {
-    for (int i = 0; i < NUM_ANGLES; i++)
-    {
-      angleValues[i] = Serial.parseInt();
-      angleValues[i] = constrain(angleValues[i], 0, 180);
-    }
-
-    while (Serial.available()) Serial.read();
-
-    // --- Apply angles directly ---
-
     writeServoAngle(servoChannel[0], angleValues[0]);          // Root
     writeServoAngle(servoChannel[1], angleValues[1]);          // Arm A1
     writeServoAngle(servoChannel[2], 180 - angleValues[1]);    // Arm A2 mirror
