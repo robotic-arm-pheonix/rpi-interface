@@ -7,7 +7,7 @@
 const int NUM_SERVOS = 7;
 const int NUM_ANGLES = 6;
 
-uint8_t servoChannel[NUM_SERVOS] = { 0, 1, 2, 3, 4, 5, 6 };
+uint8_t servoChannel[NUM_SERVOS] = { 11, 1, 2, 3, 4, 5, 6 };
 
 const uint16_t SERVO_FREQ = 50;
 const uint16_t SERVOMIN  = 102;  // ~500µs
