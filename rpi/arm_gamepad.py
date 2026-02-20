@@ -6,9 +6,8 @@ import serial
 from evdev import InputDevice, ecodes, list_devices
 
 BAUD = 115200
-SEND_HZ = 30.0  # send rate
-
-STEP_DEG = 3    # D-pad step size for wrist angles
+SEND_HZ = 30.0
+STEP_DEG = 3
 
 def clamp(x, lo, hi):
     return lo if x < lo else hi if x > hi else x
@@ -25,20 +24,16 @@ def find_arduino_port():
 
 def find_gamepad():
     devs = [InputDevice(p) for p in list_devices()]
-    # Prefer obvious controller names
     for d in devs:
         name = (d.name or "").lower()
         if any(k in name for k in ["controller", "gamepad", "xbox", "sony", "dualshock", "8bitdo"]):
             return d
-    # Fallback: anything with ABS axes
     for d in devs:
-        caps = d.capabilities().get(ecodes.EV_ABS, [])
-        if caps:
+        if d.capabilities().get(ecodes.EV_ABS):
             return d
     return None
 
 def get_abs_ranges(pad: InputDevice):
-    # best-effort axis min/max
     abs_info = {}
     try:
         for code, info in pad.absinfo.items():
@@ -47,18 +42,23 @@ def get_abs_ranges(pad: InputDevice):
         pass
     return abs_info
 
-def read_events_nonblocking(pad: InputDevice):
+def drain_events_safe(pad: InputDevice, max_events=64):
     """
-    Read all pending events without crashing when none are available.
+    Non-blocking: read up to max_events events using read_one().
+    This never throws BlockingIOError when no events are available.
     """
-    try:
-        return pad.read()
-    except BlockingIOError:
-        return []
-    except OSError as e:
-        if e.errno == errno.EAGAIN:
-            return []
-        raise
+    out = []
+    for _ in range(max_events):
+        try:
+            ev = pad.read_one()   # returns None if no event is ready
+        except OSError as e:
+            if e.errno in (errno.EAGAIN, 11):
+                return out
+            raise
+        if ev is None:
+            break
+        out.append(ev)
+    return out
 
 def main():
     port = find_arduino_port()
@@ -73,30 +73,28 @@ def main():
     print(f"Using gamepad: {pad.path} ({pad.name})")
 
     ser = serial.Serial(port, BAUD, timeout=0.01)
-    time.sleep(2.0)  # UNO resets on serial open
+    time.sleep(2.0)
 
-    # Angles: [Root, ArmA1, ArmB, WristA, WristB, Gripper]
+    # [Root, ArmA1, ArmB, WristA, WristB, Gripper]
     angles = [90, 90, 90, 90, 90, 90]
 
     abs_state = {}
     key_state = {}
-
     abs_info = get_abs_ranges(pad)
 
-    last_send = 0.0
     period = 1.0 / SEND_HZ
+    last_send = 0.0
 
-    # Optional exclusive access (prevents other apps from reading controller)
+    # Optional exclusive access
     try:
         pad.grab()
     except Exception:
-        # Not fatal; continue without grab
         pass
 
     try:
         while True:
-            # Read pending events (non-blocking, safe)
-            events = read_events_nonblocking(pad)
+            # Read pending events safely (non-blocking)
+            events = drain_events_safe(pad, max_events=128)
 
             for ev in events:
                 if ev.type == ecodes.EV_ABS:
@@ -108,8 +106,6 @@ def main():
             if now - last_send >= period:
                 last_send = now
 
-                # --- map inputs to angles ---
-
                 # Left stick X -> Root
                 if ecodes.ABS_X in abs_state:
                     v = abs_state[ecodes.ABS_X]
@@ -117,7 +113,7 @@ def main():
                     in_min, in_max = (info.min, info.max) if info else (-32768, 32767)
                     angles[0] = int(map_range(v, in_min, in_max, 0, 180))
 
-                # Left stick Y -> Arm A1 (invert so up increases)
+                # Left stick Y -> Arm A1 (invert)
                 if ecodes.ABS_Y in abs_state:
                     v = abs_state[ecodes.ABS_Y]
                     info = abs_info.get(ecodes.ABS_Y)
@@ -131,7 +127,7 @@ def main():
                     in_min, in_max = (info.min, info.max) if info else (-32768, 32767)
                     angles[2] = int(map_range(v, in_min, in_max, 180, 0))
 
-                # D-pad -> Wrist A/B (hat)
+                # D-pad -> Wrist A/B
                 if ecodes.ABS_HAT0Y in abs_state:
                     haty = abs_state[ecodes.ABS_HAT0Y]  # -1 up, +1 down
                     if haty != 0:
@@ -142,27 +138,25 @@ def main():
                     if hatx != 0:
                         angles[4] = clamp(angles[4] + (hatx * STEP_DEG), 0, 180)
 
-                # Triggers -> Gripper (ABS_Z / ABS_RZ commonly)
-                lt = abs_state.get(ecodes.ABS_Z, None)
-                rt = abs_state.get(ecodes.ABS_RZ, None)
+                # Triggers -> Gripper (ABS_Z/ABS_RZ)
+                lt = abs_state.get(ecodes.ABS_Z)
+                rt = abs_state.get(ecodes.ABS_RZ)
                 if lt is not None or rt is not None:
                     def norm(code, val):
                         info = abs_info.get(code)
                         mn, mx = (info.min, info.max) if info else (0, 255)
-                        if mx == mn:
+                        if val is None or mx == mn:
                             return 0.0
                         return clamp((val - mn) / (mx - mn), 0.0, 1.0)
 
-                    lt_n = norm(ecodes.ABS_Z, lt) if lt is not None else 0.0
-                    rt_n = norm(ecodes.ABS_RZ, rt) if rt is not None else 0.0
+                    lt_n = norm(ecodes.ABS_Z, lt)
+                    rt_n = norm(ecodes.ABS_RZ, rt)
 
                     grip = map_range(rt_n - lt_n, -1.0, 1.0, 0, 180)
                     angles[5] = int(clamp(grip, 0, 180))
 
-                # Final clamp
                 angles = [clamp(a, 0, 180) for a in angles]
 
-                # Send to Arduino
                 line = "{} {} {} {} {} {}\n".format(*angles)
                 ser.write(line.encode("ascii"))
 
