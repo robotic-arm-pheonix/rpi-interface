@@ -10,13 +10,12 @@ from evdev import InputDevice, ecodes, list_devices
 # CONFIG
 # =======================
 
-# Match Arduino Serial.begin(...)
 BAUD = 9600
 SEND_HZ = 30.0
 
 # Root behavior
-ROOT_STEP_DEG = 10      # <-- X degrees per L1/R1 press (CHANGE THIS)
-ROOT_HOME = 90         # home angle
+ROOT_STEP_DEG = 10      # <-- X degrees per L1/R1 press
+ROOT_HOME = 90
 ROOT_MIN = 0
 ROOT_MAX = 180
 
@@ -24,22 +23,22 @@ ROOT_MAX = 180
 WRIST_STEP_DEG = 3
 
 # Debug
-DEBUG_LIST_DEVICES = True   # prints all /dev/input devices with a score
-DEBUG_KEYS = True           # prints key events (button presses)
-DEBUG_SEND = True           # prints outgoing serial line sometimes
+DEBUG_LIST_DEVICES = True
+DEBUG_KEYS = True
+DEBUG_SEND = True
 PRINT_SEND_EVERY_SEC = 0.25
 
-# Force a specific input device if needed, e.g.:
-# export GAMEPAD_DEV=/dev/input/event7
-FORCED_GAMEPAD_DEV = os.environ.get("GAMEPAD_DEV")
+# If set, always use this device path (example: /dev/input/event7)
+FORCED_GAMEPAD_DEV = os.environ.get("GAMEPAD_DEV", "").strip() or None
 
 # Button mapping
-# L1/R1 (shoulder buttons)
 L1_CODES = [ecodes.BTN_TL, ecodes.BTN_TL2]
 R1_CODES = [ecodes.BTN_TR, ecodes.BTN_TR2]
+HOME_CODES = [ecodes.BTN_START]     # press START -> root goes home
 
-# Root home button (change if you want)
-HOME_CODES = [ecodes.BTN_START]     # press START -> root goes to ROOT_HOME
+# Reconnect behavior
+RECONNECT_SCAN_SEC = 1.0            # how often to rescan when pad missing
+PAD_EVENT_DRAIN_MAX = 256           # events drained per loop
 
 # =======================
 # Helpers
@@ -62,14 +61,15 @@ def ec_name(code):
     return ecodes.KEY.get(code, ecodes.BTN.get(code, str(code)))
 
 def drain_events_safe(pad: InputDevice, max_events=128):
-    """Non-blocking event drain, safe under Docker."""
     out = []
     for _ in range(max_events):
         try:
             ev = pad.read_one()
         except OSError as e:
+            # EAGAIN means "no events right now"
             if e.errno in (errno.EAGAIN, 11):
                 return out
+            # ENODEV / "No such device" happens on disconnect
             raise
         if ev is None:
             break
@@ -86,7 +86,6 @@ def get_abs_ranges(pad: InputDevice):
     return abs_info
 
 def device_score(dev: InputDevice) -> int:
-    """Pick the best evdev node for a controller (some pads expose multiple)."""
     caps = dev.capabilities()
     score = 0
     abs_codes = caps.get(ecodes.EV_ABS, [])
@@ -116,29 +115,75 @@ def device_score(dev: InputDevice) -> int:
 
     return score
 
-def pick_gamepad():
+def list_and_pick_gamepad():
+    """
+    Returns an InputDevice or None.
+    Picks best-scoring device unless FORCED_GAMEPAD_DEV is set.
+    """
     if FORCED_GAMEPAD_DEV:
-        return InputDevice(FORCED_GAMEPAD_DEV)
+        try:
+            return InputDevice(FORCED_GAMEPAD_DEV)
+        except Exception as e:
+            print(f"[PAD] Forced device not available: {FORCED_GAMEPAD_DEV} ({e})")
+            return None
 
-    devs = [InputDevice(p) for p in list_devices()]
+    devs = []
+    for p in list_devices():
+        try:
+            devs.append(InputDevice(p))
+        except Exception:
+            pass
+
+    if not devs:
+        return None
 
     if DEBUG_LIST_DEVICES:
-        print("---- /dev/input devices ----")
+        print("[PAD] ---- /dev/input devices ----")
         for d in devs:
-            caps = d.capabilities()
-            abs_codes = caps.get(ecodes.EV_ABS, [])
-            key_codes = caps.get(ecodes.EV_KEY, [])
-            print(f"{d.path}  name='{d.name}'  score={device_score(d)}  ABS={len(abs_codes)} KEY={len(key_codes)}")
-        print("----------------------------")
+            try:
+                caps = d.capabilities()
+                abs_codes = caps.get(ecodes.EV_ABS, [])
+                key_codes = caps.get(ecodes.EV_KEY, [])
+                print(f"[PAD] {d.path} name='{d.name}' score={device_score(d)} ABS={len(abs_codes)} KEY={len(key_codes)}")
+            except Exception as e:
+                print(f"[PAD] {d.path} (error reading caps: {e})")
+        print("[PAD] ----------------------------")
 
     best = None
     best_score = -1
     for d in devs:
-        s = device_score(d)
+        try:
+            s = device_score(d)
+        except Exception:
+            continue
         if s > best_score:
             best_score = s
             best = d
+
     return best
+
+def connect_gamepad():
+    """
+    Keep scanning until a usable gamepad is found.
+    Returns (pad, abs_info, abs_state, key_state, prev states).
+    """
+    while True:
+        pad = list_and_pick_gamepad()
+        if pad is not None:
+            try:
+                # open some info to ensure it's really accessible
+                _ = pad.name
+                abs_info = get_abs_ranges(pad)
+                print(f"[PAD] Connected: {pad.path} ({pad.name})")
+                print("[PAD] L1 codes:", [(c, ec_name(c)) for c in L1_CODES])
+                print("[PAD] R1 codes:", [(c, ec_name(c)) for c in R1_CODES])
+                print("[PAD] HOME codes:", [(c, ec_name(c)) for c in HOME_CODES])
+                return pad, abs_info, {}, {}, False, False, False
+            except Exception as e:
+                print(f"[PAD] Failed to open candidate {getattr(pad,'path','?')}: {e}")
+
+        print("[PAD] No controller found. Scanning again...")
+        time.sleep(RECONNECT_SCAN_SEC)
 
 # =======================
 # Main
@@ -149,53 +194,49 @@ def main():
     if not port:
         raise SystemExit("Arduino serial port not found. Check /dev/ttyACM0 or /dev/ttyUSB0")
 
-    pad = pick_gamepad()
-    if not pad:
-        raise SystemExit("Gamepad not found.")
-
-    print(f"Using Arduino port: {port}  BAUD={BAUD}")
-    print(f"Using gamepad: {pad.path} ({pad.name})")
-    print(f"ROOT_STEP_DEG={ROOT_STEP_DEG}  ROOT_HOME={ROOT_HOME}")
-    print("L1 codes:", [(c, ec_name(c)) for c in L1_CODES])
-    print("R1 codes:", [(c, ec_name(c)) for c in R1_CODES])
-    print("HOME codes:", [(c, ec_name(c)) for c in HOME_CODES])
-    if FORCED_GAMEPAD_DEV:
-        print("FORCED GAMEPAD DEV:", FORCED_GAMEPAD_DEV)
-
+    print(f"[SERIAL] Using Arduino port: {port}  BAUD={BAUD}")
     ser = serial.Serial(port, BAUD, timeout=0.05)
     time.sleep(2.0)
 
     # Angles: [Root, ArmA1, ArmB, WristA, WristB, Gripper]
     angles = [ROOT_HOME, 90, 90, 90, 90, 90]
 
-    abs_state = {}
-    key_state = {}
-    abs_info = get_abs_ranges(pad)
-
     period = 1.0 / SEND_HZ
     last_send = 0.0
     last_print = 0.0
 
-    # Rising-edge detection for step buttons
-    prev_l1 = False
-    prev_r1 = False
-    prev_home = False
-
-    # NOTE: not using pad.grab() because it can block events in some setups.
-    # If you want exclusive access, uncomment:
-    # pad.grab()
+    # Initial pad connect (blocks until found)
+    pad, abs_info, abs_state, key_state, prev_l1, prev_r1, prev_home = connect_gamepad()
 
     while True:
-        events = drain_events_safe(pad, max_events=256)
+        # If pad disconnects, reading will throw (often ENODEV)
+        try:
+            events = drain_events_safe(pad, max_events=PAD_EVENT_DRAIN_MAX)
+        except OSError as e:
+            # Controller disconnected
+            print(f"[PAD] Disconnected ({e}). Reconnecting...")
+            try:
+                pad.close()
+            except Exception:
+                pass
+            pad, abs_info, abs_state, key_state, prev_l1, prev_r1, prev_home = connect_gamepad()
+            continue
+        except Exception as e:
+            print(f"[PAD] Error reading controller ({e}). Reconnecting...")
+            try:
+                pad.close()
+            except Exception:
+                pass
+            pad, abs_info, abs_state, key_state, prev_l1, prev_r1, prev_home = connect_gamepad()
+            continue
 
         for ev in events:
             if ev.type == ecodes.EV_ABS:
                 abs_state[ev.code] = ev.value
-
             elif ev.type == ecodes.EV_KEY:
                 key_state[ev.code] = ev.value
                 if DEBUG_KEYS:
-                    print(f"KEY: code={ev.code} name={ec_name(ev.code)} value={ev.value}")
+                    print(f"[KEY] code={ev.code} name={ec_name(ev.code)} value={ev.value}")
 
         # Press state (treat 1 press and 2 hold as pressed)
         l1 = any(key_state.get(c, 0) in (1, 2) for c in L1_CODES)
@@ -205,16 +246,16 @@ def main():
         # Root home on rising edge
         if home and not prev_home:
             angles[0] = int(clamp(ROOT_HOME, ROOT_MIN, ROOT_MAX))
-            print(f"ROOT -> HOME ({angles[0]})")
+            print(f"[ROOT] -> HOME ({angles[0]})")
 
         # Root step on rising edge
         if l1 and not prev_l1 and not r1:
             angles[0] = int(clamp(angles[0] - ROOT_STEP_DEG, ROOT_MIN, ROOT_MAX))
-            print(f"ROOT step LEFT -> {angles[0]}")
+            print(f"[ROOT] step LEFT -> {angles[0]}")
 
         if r1 and not prev_r1 and not l1:
             angles[0] = int(clamp(angles[0] + ROOT_STEP_DEG, ROOT_MIN, ROOT_MAX))
-            print(f"ROOT step RIGHT -> {angles[0]}")
+            print(f"[ROOT] step RIGHT -> {angles[0]}")
 
         prev_l1 = l1
         prev_r1 = r1
@@ -271,11 +312,14 @@ def main():
                 angles[i] = int(clamp(angles[i], 0, 180))
 
             line = "{} {} {} {} {} {}\n".format(*angles)
-            ser.write(line.encode("ascii"))
+            try:
+                ser.write(line.encode("ascii"))
+            except Exception as e:
+                print(f"[SERIAL] write failed: {e}")
 
             if DEBUG_SEND and (now - last_print) >= PRINT_SEND_EVERY_SEC:
                 last_print = now
-                print("SEND:", line.strip())
+                print("[SEND]", line.strip())
 
         time.sleep(0.001)
 
