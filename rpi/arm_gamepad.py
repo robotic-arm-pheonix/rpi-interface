@@ -28,7 +28,7 @@ DEBUG_KEYS = True
 DEBUG_SEND = True
 PRINT_SEND_EVERY_SEC = 0.25
 
-# If set, always use this device path (example: /dev/input/event7)
+# Optional force: set to a stable symlink like /dev/input/by-id/...-event-joystick
 FORCED_GAMEPAD_DEV = os.environ.get("GAMEPAD_DEV", "").strip() or None
 
 # Button mapping
@@ -37,8 +37,8 @@ R1_CODES = [ecodes.BTN_TR, ecodes.BTN_TR2]
 HOME_CODES = [ecodes.BTN_START]     # press START -> root goes home
 
 # Reconnect behavior
-RECONNECT_SCAN_SEC = 1.0            # how often to rescan when pad missing
-PAD_EVENT_DRAIN_MAX = 256           # events drained per loop
+RECONNECT_SCAN_SEC = 1.0
+PAD_EVENT_DRAIN_MAX = 256
 
 # =======================
 # Helpers
@@ -66,11 +66,9 @@ def drain_events_safe(pad: InputDevice, max_events=128):
         try:
             ev = pad.read_one()
         except OSError as e:
-            # EAGAIN means "no events right now"
-            if e.errno in (errno.EAGAIN, 11):
+            if e.errno in (errno.EAGAIN, 11):  # no events right now
                 return out
-            # ENODEV / "No such device" happens on disconnect
-            raise
+            raise  # ENODEV etc => disconnected
         if ev is None:
             break
         out.append(ev)
@@ -85,104 +83,130 @@ def get_abs_ranges(pad: InputDevice):
         pass
     return abs_info
 
-def device_score(dev: InputDevice) -> int:
-    caps = dev.capabilities()
-    score = 0
-    abs_codes = caps.get(ecodes.EV_ABS, [])
-    key_codes = caps.get(ecodes.EV_KEY, [])
+GAMEPAD_BUTTONS = {
+    ecodes.BTN_SOUTH, ecodes.BTN_EAST, ecodes.BTN_NORTH, ecodes.BTN_WEST,
+    ecodes.BTN_TL, ecodes.BTN_TR, ecodes.BTN_SELECT, ecodes.BTN_START,
+    ecodes.BTN_THUMBL, ecodes.BTN_THUMBR,
+}
 
-    if abs_codes:
-        score += 10
-    if key_codes:
-        score += 10
+GAMEPAD_AXES = {ecodes.ABS_X, ecodes.ABS_Y, ecodes.ABS_RX, ecodes.ABS_RY, ecodes.ABS_Z, ecodes.ABS_RZ}
 
-    common_btns = [
-        ecodes.BTN_SOUTH, ecodes.BTN_EAST, ecodes.BTN_NORTH, ecodes.BTN_WEST,
-        ecodes.BTN_TL, ecodes.BTN_TR, ecodes.BTN_START, ecodes.BTN_SELECT
-    ]
-    for b in common_btns:
-        if b in key_codes:
-            score += 3
+def is_real_gamepad(dev: InputDevice) -> bool:
+    """
+    Filter out keyboard/mouse/HDMI/event nodes.
+    """
+    try:
+        caps = dev.capabilities()
+    except Exception:
+        return False
 
-    common_axes = [ecodes.ABS_X, ecodes.ABS_Y, ecodes.ABS_RX, ecodes.ABS_RY, ecodes.ABS_Z, ecodes.ABS_RZ]
-    for a in common_axes:
-        if a in abs_codes:
-            score += 2
+    abs_codes = set(caps.get(ecodes.EV_ABS, []))
+    key_codes = set(caps.get(ecodes.EV_KEY, []))
 
     name = (dev.name or "").lower()
-    if any(k in name for k in ["8bitdo", "xbox", "wireless controller", "gamepad", "controller"]):
-        score += 5
 
-    return score
+    # Reject obvious non-gamepad names
+    if "keyboard" in name or "mouse" in name or "hdmi" in name or "pwr_button" in name:
+        return False
 
-def list_and_pick_gamepad():
+    # Must have at least 2 ABS axes to be a controller (sticks / triggers)
+    if len(abs_codes) < 2:
+        return False
+
+    # Must have at least one typical gamepad axis
+    if not (abs_codes & GAMEPAD_AXES):
+        return False
+
+    # Must have at least one typical gamepad button
+    if not (key_codes & GAMEPAD_BUTTONS):
+        return False
+
+    # Reject keyboard-like devices that have hundreds of keys
+    if len(key_codes) > 100:
+        return False
+
+    return True
+
+def preferred_by_id_paths():
     """
-    Returns an InputDevice or None.
-    Picks best-scoring device unless FORCED_GAMEPAD_DEV is set.
+    Stable symlinks for controllers usually appear here.
+    Prefer *event-joystick if available.
     """
-    if FORCED_GAMEPAD_DEV:
-        try:
-            return InputDevice(FORCED_GAMEPAD_DEV)
-        except Exception as e:
-            print(f"[PAD] Forced device not available: {FORCED_GAMEPAD_DEV} ({e})")
-            return None
+    paths = sorted(glob.glob("/dev/input/by-id/*event-joystick"))
+    return paths
 
-    devs = []
-    for p in list_devices():
+def list_candidates():
+    """
+    Return list of InputDevice objects that look like real gamepads.
+    Prefer by-id stable paths first.
+    """
+    candidates = []
+
+    # 1) by-id stable event-joystick first
+    for p in preferred_by_id_paths():
         try:
-            devs.append(InputDevice(p))
+            d = InputDevice(p)
+            if is_real_gamepad(d):
+                candidates.append(d)
         except Exception:
             pass
 
-    if not devs:
-        return None
-
-    if DEBUG_LIST_DEVICES:
-        print("[PAD] ---- /dev/input devices ----")
-        for d in devs:
-            try:
-                caps = d.capabilities()
-                abs_codes = caps.get(ecodes.EV_ABS, [])
-                key_codes = caps.get(ecodes.EV_KEY, [])
-                print(f"[PAD] {d.path} name='{d.name}' score={device_score(d)} ABS={len(abs_codes)} KEY={len(key_codes)}")
-            except Exception as e:
-                print(f"[PAD] {d.path} (error reading caps: {e})")
-        print("[PAD] ----------------------------")
-
-    best = None
-    best_score = -1
-    for d in devs:
+    # 2) fallback: scan all event devices
+    for p in list_devices():
         try:
-            s = device_score(d)
+            d = InputDevice(p)
+            if is_real_gamepad(d):
+                candidates.append(d)
         except Exception:
-            continue
-        if s > best_score:
-            best_score = s
-            best = d
+            pass
 
-    return best
+    return candidates
 
 def connect_gamepad():
     """
-    Keep scanning until a usable gamepad is found.
-    Returns (pad, abs_info, abs_state, key_state, prev states).
+    Blocks until a real gamepad is available, then returns:
+    pad, abs_info, abs_state, key_state, prev_l1, prev_r1, prev_home
     """
     while True:
-        pad = list_and_pick_gamepad()
-        if pad is not None:
+        if FORCED_GAMEPAD_DEV:
             try:
-                # open some info to ensure it's really accessible
-                _ = pad.name
-                abs_info = get_abs_ranges(pad)
-                print(f"[PAD] Connected: {pad.path} ({pad.name})")
-                print("[PAD] L1 codes:", [(c, ec_name(c)) for c in L1_CODES])
-                print("[PAD] R1 codes:", [(c, ec_name(c)) for c in R1_CODES])
-                print("[PAD] HOME codes:", [(c, ec_name(c)) for c in HOME_CODES])
-                return pad, abs_info, {}, {}, False, False, False
+                pad = InputDevice(FORCED_GAMEPAD_DEV)
+                if is_real_gamepad(pad):
+                    print(f"[PAD] Connected (forced): {pad.path} ({pad.name})")
+                    return pad, get_abs_ranges(pad), {}, {}, False, False, False
+                else:
+                    print(f"[PAD] Forced device not a real gamepad: {FORCED_GAMEPAD_DEV} ({pad.name})")
             except Exception as e:
-                print(f"[PAD] Failed to open candidate {getattr(pad,'path','?')}: {e}")
+                print(f"[PAD] Forced device not available: {FORCED_GAMEPAD_DEV} ({e})")
 
-        print("[PAD] No controller found. Scanning again...")
+        cands = list_candidates()
+
+        if DEBUG_LIST_DEVICES:
+            print("[PAD] ---- candidates ----")
+            if cands:
+                for d in cands:
+                    caps = d.capabilities()
+                    abs_n = len(caps.get(ecodes.EV_ABS, []))
+                    key_n = len(caps.get(ecodes.EV_KEY, []))
+                    print(f"[PAD] {d.path} name='{d.name}' ABS={abs_n} KEY={key_n}")
+            else:
+                print("[PAD] (none)")
+            print("[PAD] -------------------")
+
+        if cands:
+            # If multiple, choose one with name containing '8bitdo' first, else first
+            cands_sorted = sorted(
+                cands,
+                key=lambda d: (("8bitdo" not in (d.name or "").lower()), d.path)
+            )
+            pad = cands_sorted[0]
+            print(f"[PAD] Connected: {pad.path} ({pad.name})")
+            print("[PAD] L1 codes:", [(c, ec_name(c)) for c in L1_CODES])
+            print("[PAD] R1 codes:", [(c, ec_name(c)) for c in R1_CODES])
+            print("[PAD] HOME codes:", [(c, ec_name(c)) for c in HOME_CODES])
+            return pad, get_abs_ranges(pad), {}, {}, False, False, False
+
+        print("[PAD] No real controller found. Scanning again...")
         time.sleep(RECONNECT_SCAN_SEC)
 
 # =======================
@@ -205,15 +229,12 @@ def main():
     last_send = 0.0
     last_print = 0.0
 
-    # Initial pad connect (blocks until found)
     pad, abs_info, abs_state, key_state, prev_l1, prev_r1, prev_home = connect_gamepad()
 
     while True:
-        # If pad disconnects, reading will throw (often ENODEV)
         try:
             events = drain_events_safe(pad, max_events=PAD_EVENT_DRAIN_MAX)
         except OSError as e:
-            # Controller disconnected
             print(f"[PAD] Disconnected ({e}). Reconnecting...")
             try:
                 pad.close()
@@ -222,7 +243,7 @@ def main():
             pad, abs_info, abs_state, key_state, prev_l1, prev_r1, prev_home = connect_gamepad()
             continue
         except Exception as e:
-            print(f"[PAD] Error reading controller ({e}). Reconnecting...")
+            print(f"[PAD] Read error ({e}). Reconnecting...")
             try:
                 pad.close()
             except Exception:
@@ -238,7 +259,7 @@ def main():
                 if DEBUG_KEYS:
                     print(f"[KEY] code={ev.code} name={ec_name(ev.code)} value={ev.value}")
 
-        # Press state (treat 1 press and 2 hold as pressed)
+        # Button pressed state (1 press, 2 hold)
         l1 = any(key_state.get(c, 0) in (1, 2) for c in L1_CODES)
         r1 = any(key_state.get(c, 0) in (1, 2) for c in R1_CODES)
         home = any(key_state.get(c, 0) in (1, 2) for c in HOME_CODES)
@@ -257,9 +278,7 @@ def main():
             angles[0] = int(clamp(angles[0] + ROOT_STEP_DEG, ROOT_MIN, ROOT_MAX))
             print(f"[ROOT] step RIGHT -> {angles[0]}")
 
-        prev_l1 = l1
-        prev_r1 = r1
-        prev_home = home
+        prev_l1, prev_r1, prev_home = l1, r1, home
 
         now = time.time()
         if now - last_send >= period:
@@ -306,16 +325,13 @@ def main():
                 grip = map_range(rt_n - lt_n, -1.0, 1.0, 0, 180)
                 angles[5] = int(clamp(grip, 0, 180))
 
-            # Final clamp
+            # Clamp all
             angles[0] = int(clamp(angles[0], ROOT_MIN, ROOT_MAX))
             for i in range(1, 6):
                 angles[i] = int(clamp(angles[i], 0, 180))
 
             line = "{} {} {} {} {} {}\n".format(*angles)
-            try:
-                ser.write(line.encode("ascii"))
-            except Exception as e:
-                print(f"[SERIAL] write failed: {e}")
+            ser.write(line.encode("ascii"))
 
             if DEBUG_SEND and (now - last_print) >= PRINT_SEND_EVERY_SEC:
                 last_print = now
