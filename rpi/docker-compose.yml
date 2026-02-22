@@ -12,10 +12,9 @@ services:
 
     volumes:
       - ./arm_gamepad.py:/app/arm_gamepad.py:ro
-      # expose stable symlink dirs inside container
+      # allow generic stable detection for any controller
       - /dev/input/by-id:/dev/input/by-id:ro
       - /dev/input/by-path:/dev/input/by-path:ro
 
     environment:
       - PYTHONUNBUFFERED=1
-      - GAMEPAD_DEV=/dev/input/by-id/usb-8BitDo_8BitDo_Ultimate_2C_Wireless_Controller_02E29EA491-event-joystick
