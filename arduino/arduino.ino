@@ -4,10 +4,10 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 
-const int NUM_SERVOS = 7;
+const int NUM_SERVOS = 8;
 const int NUM_ANGLES = 6;
 
-uint8_t servoChannel[NUM_SERVOS] = { 11, 1, 2, 3, 4, 5, 6 };
+uint8_t servoChannel[NUM_SERVOS] = { 11, 12, 1, 2, 3, 4, 5, 6 };
 
 const uint16_t SERVO_FREQ = 50;
 const uint16_t SERVOMIN  = 102;  // ~500µs
@@ -37,19 +37,16 @@ bool readAnglesFromSerial(int *outAngles, int count)
   {
     char c = (char)Serial.read();
 
-    // end of line
     if (c == '\n')
     {
       buf[idx] = '\0';
       idx = 0;
 
-      // parse exactly "a b c d e f"
       int parsed = 0;
       char *p = buf;
 
       for (int i = 0; i < count; i++)
       {
-        // skip spaces
         while (*p == ' ') p++;
         if (*p == '\0') return false;
 
@@ -64,7 +61,7 @@ bool readAnglesFromSerial(int *outAngles, int count)
       if (idx < sizeof(buf) - 1)
         buf[idx++] = c;
       else
-        idx = 0; // overflow -> reset
+        idx = 0;
     }
   }
   return false;
@@ -89,11 +86,12 @@ void loop()
   if (readAnglesFromSerial(angleValues, NUM_ANGLES))
   {
     writeServoAngle(servoChannel[0], angleValues[0]);          // Root
-    writeServoAngle(servoChannel[1], angleValues[1]);          // Arm A1
-    writeServoAngle(servoChannel[2], 180 - angleValues[1]);    // Arm A2 mirror
-    writeServoAngle(servoChannel[3], angleValues[2]);          // Arm B
-    writeServoAngle(servoChannel[4], angleValues[3]);          // Wrist A
-    writeServoAngle(servoChannel[5], angleValues[4]);          // Wrist B
-    writeServoAngle(servoChannel[6], angleValues[5]);          // Gripper
+    writeServoAngle(servoChannel[1], angleValues[0]);          // New servo on ch 12 follows Root exactly
+    writeServoAngle(servoChannel[2], angleValues[1]);          // Arm A1
+    writeServoAngle(servoChannel[3], 180 - angleValues[1]);    // Arm A2 mirror
+    writeServoAngle(servoChannel[4], angleValues[2]);          // Arm B
+    writeServoAngle(servoChannel[5], angleValues[3]);          // Wrist A
+    writeServoAngle(servoChannel[6], angleValues[4]);          // Wrist B
+    writeServoAngle(servoChannel[7], angleValues[5]);          // Gripper
   }
 }
