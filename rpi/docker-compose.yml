@@ -12,9 +12,11 @@ services:
 
     volumes:
       - ./arm_gamepad.py:/app/arm_gamepad.py:ro
-      # allow generic stable detection for any controller
       - /dev/input/by-id:/dev/input/by-id:ro
       - /dev/input/by-path:/dev/input/by-path:ro
+
+    ports:
+      - "5000:5000"
 
     environment:
       - PYTHONUNBUFFERED=1
